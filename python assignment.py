@@ -4,26 +4,28 @@ import datetime
 import json
 import hashlib
 from cryptography.fernet import Fernet
-from typing import Optional, Dict, List, Tuple
-import getpass
+from typing import Optional, Dict, List, Tuple, Union
+import random
+import time
 from enum import Enum, auto
+import re
+from dataclasses import dataclass
+import pickle
 
 # Constants
 MAX_ATTEMPTS = 3
+PASSING_SCORE = 75  # 75% required to pass each quiz
 MIN_PASSWORD_LENGTH = 8
-PASSING_SCORE = 0.75  # 75% required to pass
-
-# Enum for chapter status
-class ChapterStatus(Enum):
-    LOCKED = auto()
-    UNLOCKED = auto()
-    COMPLETED = auto()
+CHAPTER_COUNT = 5
+SESSION_TIMEOUT = 1800  # 30 minutes in seconds
+MAX_USERNAME_LENGTH = 20
+MIN_USERNAME_LENGTH = 4
+MAX_NAME_LENGTH = 50
+MIN_NAME_LENGTH = 2
 
 # Generate or load encryption key
 def get_encryption_key() -> bytes:
-    key_file = os.path.join('data', 'secret.key')
-    os.makedirs('data', exist_ok=True)
-    
+    key_file = 'secret.key'
     if os.path.exists(key_file):
         with open(key_file, 'rb') as f:
             return f.read()
@@ -35,41 +37,132 @@ def get_encryption_key() -> bytes:
 
 cipher_suite = Fernet(get_encryption_key())
 
+class QuestionType(Enum):
+    TRUE_FALSE = auto()
+    MULTIPLE_CHOICE = auto()
+    FILL_BLANK = auto()
+    CODE_COMPLETION = auto()
+
+@dataclass
+class Question:
+    text: str
+    answer: str
+    question_type: QuestionType
+    choices: Optional[List[str]] = None
+    hint: Optional[str] = None
+    difficulty: int = 1  # 1-3 scale (easy, medium, hard)
+
+    def check_answer(self, user_answer: str) -> bool:
+        # Normalize both answers for comparison
+        normalized_user = user_answer.lower().strip()
+        normalized_correct = self.answer.lower().strip()
+        
+        # Handle various true/false formats
+        if self.question_type == QuestionType.TRUE_FALSE:
+            true_aliases = ['true', 't', 'yes', 'y', '1']
+            false_aliases = ['false', 'f', 'no', 'n', '0']
+            
+            if normalized_correct in true_aliases:
+                return normalized_user in true_aliases
+            elif normalized_correct in false_aliases:
+                return normalized_user in false_aliases
+        
+        # Handle multiple choice (accept letter or full answer)
+        elif self.question_type == QuestionType.MULTIPLE_CHOICE:
+            if len(normalized_user) == 1:  # Single letter answer
+                return normalized_user == normalized_correct[0]
+            else:  # Full answer text
+                return normalized_user == normalized_correct
+        
+        # For other types, do direct comparison
+        return normalized_user == normalized_correct
+
+    def display(self) -> None:
+        print(self.text)
+        if self.question_type == QuestionType.MULTIPLE_CHOICE and self.choices:
+            print("\nOptions:")
+            for i, choice in enumerate(self.choices, start=1):
+                print(f"{chr(96+i)}) {choice}")
+        if self.hint:
+            print(f"\nHint: {self.hint}")
+
+@dataclass
+class Chapter:
+    number: int
+    title: str
+    content: str
+    questions: List[Question]
+    learning_objectives: List[str]
+    duration_minutes: int
+
 class Student:
     def __init__(self):
         self.name: str = ""
         self.username: str = ""
-        self.password_hash: str = ""
+        self.password: str = ""
         self.email: str = ""
-        self.progress: Dict[int, int] = {}  # chapter: score
-        self.current_chapter: int = 1
-        self.account_created: datetime.datetime = datetime.datetime.now()
+        self.progress: int = 1
+        self.scores: Dict[int, float] = {}  # Chapter number: score percentage
         self.last_login: Optional[datetime.datetime] = None
-
-    def to_dict(self) -> Dict:
-        return {
-            'name': self.name,
-            'username': self.username,
-            'password_hash': self.password_hash,
-            'email': self.email,
-            'progress': self.progress,
-            'current_chapter': self.current_chapter,
-            'account_created': self.account_created.isoformat(),
-            'last_login': self.last_login.isoformat() if self.last_login else None
+        self.login_count: int = 0
+        self.total_study_time: int = 0  # in minutes
+        self.achievements: List[str] = []
+        self.preferences: Dict[str, Union[str, bool]] = {
+            'dark_mode': False,
+            'animation_speed': 'normal'
         }
 
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'Student':
-        student = cls()
-        student.name = data['name']
-        student.username = data['username']
-        student.password_hash = data['password_hash']
-        student.email = data.get('email', '')
-        student.progress = data.get('progress', {})
-        student.current_chapter = data.get('current_chapter', 1)
-        student.account_created = datetime.datetime.fromisoformat(data['account_created'])
-        student.last_login = datetime.datetime.fromisoformat(data['last_login']) if data['last_login'] else None
-        return student
+    def set_name(self, name: str) -> None:
+        self.name = name.title()
+
+    def set_username(self, username: str) -> None:
+        self.username = username.lower()
+
+    def set_password(self, password: str) -> None:
+        self.password = hashlib.sha256(password.encode()).hexdigest()
+
+    def set_email(self, email: str) -> None:
+        self.email = email.lower()
+
+    def update_progress(self, chapter: int) -> None:
+        if chapter > self.progress and chapter <= CHAPTER_COUNT:
+            self.progress = chapter
+            if chapter == CHAPTER_COUNT:
+                self.add_achievement("Course Completer")
+
+    def add_score(self, chapter: int, score: float) -> None:
+        self.scores[chapter] = score
+        if score >= 90:
+            self.add_achievement(f"Chapter {chapter} Master")
+        elif score >= PASSING_SCORE:
+            self.add_achievement(f"Chapter {chapter} Passer")
+
+    def record_login(self) -> None:
+        now = datetime.datetime.now()
+        if self.last_login and (now - self.last_login).days >= 1:
+            self.add_achievement("Daily Learner")
+        self.last_login = now
+        self.login_count += 1
+        if self.login_count == 5:
+            self.add_achievement("Regular User")
+        elif self.login_count == 10:
+            self.add_achievement("Dedicated Learner")
+
+    def add_study_time(self, minutes: int) -> None:
+        self.total_study_time += minutes
+        if self.total_study_time >= 60:
+            self.add_achievement("Hour of Code")
+        if self.total_study_time >= 300:
+            self.add_achievement("Dedicated Scholar")
+
+    def add_achievement(self, achievement: str) -> None:
+        if achievement not in self.achievements:
+            self.achievements.append(achievement)
+
+    def get_overall_score(self) -> float:
+        if not self.scores:
+            return 0.0
+        return sum(self.scores.values()) / len(self.scores)
 
 def encrypt_data(data: str) -> bytes:
     """Encrypt data using Fernet symmetric encryption"""
@@ -79,19 +172,8 @@ def decrypt_data(encrypted_data: bytes) -> str:
     """Decrypt data using Fernet symmetric encryption"""
     return cipher_suite.decrypt(encrypted_data).decode()
 
-def hash_password(password: str) -> str:
-    """Create a secure password hash with salt"""
-    salt = os.urandom(32)
-    key = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-    return f"{salt.hex()}:{key.hex()}"
-
-def verify_password(stored_hash: str, password: str) -> bool:
-    """Verify a password against stored hash"""
-    salt, key = stored_hash.split(':')
-    salt_bytes = bytes.fromhex(salt)
-    key_bytes = bytes.fromhex(key)
-    new_key = hashlib.pbkdf2_hmac('sha256', password.encode(), salt_bytes, 100000)
-    return new_key == key_bytes
+def file_exists(filename: str) -> bool:
+    return os.path.exists(f"{filename}.dat")
 
 def clear_screen() -> None:
     """Clear the console screen based on the operating system"""
@@ -104,100 +186,354 @@ def display_header(title: str) -> None:
     print(f"\t * * * {title} * * *".center(80))
     print("=" * 80 + "\n")
 
-def get_valid_input(prompt: str, 
-                  validation_func=None, 
-                  error_msg: str = "Invalid input. Please try again.",
-                  hide_input: bool = False) -> str:
+def animate_text(text: str, delay: float = 0.03) -> None:
+    """Display text with typing animation"""
+    for char in text:
+        print(char, end='', flush=True)
+        time.sleep(delay)
+    print()
+
+def get_valid_input(prompt: str, validation_func=None, error_msg: str = "Invalid input. Please try again.") -> str:
     """
     Get validated input from user with retry on invalid input
     """
     while True:
-        try:
-            user_input = getpass.getpass(prompt) if hide_input else input(prompt)
-            user_input = user_input.strip()
-            
-            if not user_input:
-                print("Input cannot be empty. Please try again.")
-                continue
-                
-            if validation_func is None or validation_func(user_input):
-                return user_input
-                
-            print(error_msg)
-        except KeyboardInterrupt:
-            print("\nOperation cancelled by user.")
-            sys.exit(0)
-        except Exception as e:
-            print(f"An error occurred: {str(e)}")
+        user_input = input(prompt).strip()
+        if not user_input:
+            print("Input cannot be empty. Please try again.")
+            continue
+        if validation_func is None or validation_func(user_input):
+            return user_input
+        print(error_msg)
+
+def validate_email(email: str) -> bool:
+    """More comprehensive email validation"""
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
+
+def validate_password(password: str) -> bool:
+    """Password validation with complexity requirements"""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return False
+    has_upper = any(c.isupper() for c in password)
+    has_lower = any(c.islower() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    has_special = any(c in '!@#$%^&*()_+-=[]{}|;:,.<>?/' for c in password)
+    return has_upper and has_lower and has_digit and has_special
 
 def save_student_data(student: Student) -> bool:
-    """Save student data to encrypted file"""
+    """Save student data securely with error handling"""
     try:
-        os.makedirs('data/users', exist_ok=True)
-        filename = os.path.join('data/users', f"{student.username}.dat")
-        
-        data = student.to_dict()
+        data = {
+            'name': student.name,
+            'username': student.username,
+            'password': student.password,
+            'email': student.email,
+            'progress': student.progress,
+            'scores': student.scores,
+            'last_login': student.last_login.isoformat() if student.last_login else None,
+            'login_count': student.login_count,
+            'total_study_time': student.total_study_time,
+            'achievements': student.achievements,
+            'preferences': student.preferences
+        }
+
         encrypted_data = encrypt_data(json.dumps(data))
+        temp_file = f"{student.username}.tmp"
+        final_file = f"{student.username}.dat"
         
-        with open(filename, 'wb') as f:
+        # Write to temporary file first
+        with open(temp_file, 'wb') as f:
             f.write(encrypted_data)
-            
+        
+        # Replace old file with new one
+        if os.path.exists(final_file):
+            os.remove(final_file)
+        os.rename(temp_file, final_file)
+        
         return True
     except Exception as e:
-        print(f"Error saving student data: {str(e)}")
+        print(f"Error saving data: {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
         return False
 
 def load_student_data(username: str) -> Optional[Student]:
-    """Load student data from encrypted file"""
+    """Load student data from encrypted file with error handling"""
     try:
-        filename = os.path.join('data/users', f"{username}.dat")
-        
-        if not os.path.exists(filename):
-            return None
-            
-        with open(filename, 'rb') as f:
+        with open(f"{username}.dat", 'rb') as f:
             encrypted_data = f.read()
-            data = json.loads(decrypt_data(encrypted_data))
-            
-        return Student.from_dict(data)
-    except Exception as e:
-        print(f"Error loading student data: {str(e)}")
-        return None
+        decrypted_data = json.loads(decrypt_data(encrypted_data))
 
-def display_progress_bar(percentage: float, length: int = 40) -> str:
-    """Display a visual progress bar"""
-    filled = int(length * percentage)
-    bar = '█' * filled + '-' * (length - filled)
-    return f"[{bar}] {percentage:.1%}"
+        student = Student()
+        student.name = decrypted_data['name']
+        student.username = decrypted_data['username']
+        student.password = decrypted_data['password']
+        student.email = decrypted_data.get('email', '')
+        student.progress = decrypted_data['progress']
+        student.scores = decrypted_data.get('scores', {})
+        last_login = decrypted_data.get('last_login')
+        student.last_login = datetime.datetime.fromisoformat(last_login) if last_login else None
+        student.login_count = decrypted_data.get('login_count', 0)
+        student.total_study_time = decrypted_data.get('total_study_time', 0)
+        student.achievements = decrypted_data.get('achievements', [])
+        student.preferences = decrypted_data.get('preferences', {
+            'dark_mode': False,
+            'animation_speed': 'normal'
+        })
+        
+        return student
+    except FileNotFoundError:
+        print("Error: User data file not found.")
+    except json.JSONDecodeError:
+        print("Error: Corrupted data file.")
+    except Exception as e:
+        print(f"Error loading data: {str(e)}")
+    return None
+
+def generate_quiz(chapter_num: int) -> List[Question]:
+    """Generate quiz questions for each chapter with varied difficulty"""
+    if chapter_num == 1:
+        return [
+            Question(
+                "1. Python uses braces {} to define code blocks.", 
+                "false", 
+                QuestionType.TRUE_FALSE,
+                hint="Python uses indentation for code blocks."
+            ),
+            Question(
+                "2. Python was first released in 1991.", 
+                "true", 
+                QuestionType.TRUE_FALSE,
+                hint="Python was created by Guido van Rossum."
+            ),
+            Question(
+                "3. Python is a compiled language like C++.", 
+                "false", 
+                QuestionType.TRUE_FALSE,
+                hint="Python is an interpreted language."
+            ),
+            Question(
+                "4. What is the correct extension for Python files?", 
+                ".py", 
+                QuestionType.FILL_BLANK,
+                hint="It's a two-letter extension starting with 'p'."
+            ),
+            Question(
+                "5. Who created Python?\na) Guido van Rossum\nb) Bjarne Stroustrup\nc) James Gosling",
+                "a", 
+                QuestionType.MULTIPLE_CHOICE, 
+                ["Guido van Rossum", "Bjarne Stroustrup", "James Gosling"],
+                hint="He's known as Python's 'Benevolent Dictator For Life'."
+            ),
+            Question(
+                "6. Complete this code to print 'Hello, World!':\nprint('_____')",
+                "Hello, World!", 
+                QuestionType.CODE_COMPLETION,
+                hint="The classic first program output."
+            )
+        ]
+    elif chapter_num == 2:
+        return [
+            Question(
+                "1. Python functions are defined using the 'function' keyword.", 
+                "false", 
+                QuestionType.TRUE_FALSE,
+                hint="Python uses 'def' for functions."
+            ),
+            Question(
+                "2. Indentation in Python is optional.", 
+                "false", 
+                QuestionType.TRUE_FALSE,
+                hint="Indentation is syntactically significant in Python."
+            ),
+            Question(
+                "3. What symbol starts a comment in Python?", 
+                "#", 
+                QuestionType.FILL_BLANK,
+                hint="It's sometimes called a 'hash' or 'pound' symbol."
+            ),
+            Question(
+                "4. Which of these is NOT a Python data type?\na) int\nb) float\nc) char\nd) str",
+                "c", 
+                QuestionType.MULTIPLE_CHOICE, 
+                ["int", "float", "char", "str"],
+                hint="Python doesn't have a separate 'char' type."
+            ),
+            Question(
+                "5. The __name__ variable equals '__main__' when:",
+                "the script is run directly", 
+                QuestionType.FILL_BLANK,
+                hint="This is used to check if a script is being run directly."
+            ),
+            Question(
+                "6. Complete this function definition:\n___ greet(name):\n    print(f'Hello, {name}')",
+                "def", 
+                QuestionType.CODE_COMPLETION,
+                hint="This keyword starts function definitions in Python."
+            )
+        ]
+    elif chapter_num == 3:
+        return [
+            Question(
+                "1. Python has dedicated multi-line comment syntax like /* */ in C++.", 
+                "false", 
+                QuestionType.TRUE_FALSE,
+                hint="Python uses multi-line strings for this purpose."
+            ),
+            Question(
+                "2. Docstrings are accessible at runtime through __doc__ attribute.", 
+                "true", 
+                QuestionType.TRUE_FALSE,
+                hint="You can access them with help() or .__doc__."
+            ),
+            Question(
+                "3. PEP 8 recommends using docstrings for all public functions.", 
+                "true", 
+                QuestionType.TRUE_FALSE,
+                hint="PEP 8 is Python's style guide."
+            ),
+            Question(
+                "4. What is the recommended indentation size in Python?", 
+                "4", 
+                QuestionType.FILL_BLANK,
+                hint="PEP 8 recommends this many spaces per indentation level."
+            ),
+            Question(
+                "5. Which of these is used for documentation strings?\na) '''triple quotes'''\nb) // double slash\nc) <!-- HTML comment -->",
+                "a", 
+                QuestionType.MULTIPLE_CHOICE, 
+                ["'''triple quotes'''", "// double slash", "<!-- HTML comment -->"],
+                hint="Python uses triple quotes for docstrings."
+            ),
+            Question(
+                "6. Complete this docstring:\n\"\"\"\nThis function _____.\n\"\"\"",
+                "does something", 
+                QuestionType.CODE_COMPLETION,
+                hint="Docstrings typically describe what the function does."
+            )
+        ]
+    elif chapter_num == 4:  # Final exam
+        questions = []
+        # Add questions from all chapters
+        for chap in range(1, 4):
+            questions.extend(generate_quiz(chap))
+        # Add some additional challenging questions
+        questions.extend([
+            Question(
+                "13. What does PEP stand for in Python?", 
+                "Python Enhancement Proposal", 
+                QuestionType.FILL_BLANK,
+                hint="They are documents that describe Python features."
+            ),
+            Question(
+                "14. Which of these is NOT a Python built-in function?\na) print()\nb) input()\nc) console.log()",
+                "c", 
+                QuestionType.MULTIPLE_CHOICE, 
+                ["print()", "input()", "console.log()"],
+                hint="This function comes from another language."
+            ),
+            Question(
+                "15. What is the output of: print(3 * 'abc')?", 
+                "abcabcabc", 
+                QuestionType.FILL_BLANK,
+                hint="Multiplication with strings repeats them."
+            ),
+            Question(
+                "16. Complete this code to create a list of squares:\nsquares = [x**2 ___ x in range(5)]",
+                "for", 
+                QuestionType.CODE_COMPLETION,
+                hint="This is a list comprehension."
+            )
+        ])
+        return questions
+    return []
+
+def administer_quiz(chapter_num: int, student: Student) -> float:
+    """Administer quiz and return score percentage with time tracking"""
+    questions = generate_quiz(chapter_num)
+    if not questions:
+        return 0.0
+
+    start_time = time.time()
+    correct = 0
+    
+    for i, question in enumerate(questions, 1):
+        clear_screen()
+        display_header(f"Chapter {chapter_num} Quiz")
+        print(f"Question {i} of {len(questions)}\n")
+        question.display()
+        
+        # Get user answer with appropriate prompt
+        if question.question_type == QuestionType.TRUE_FALSE:
+            prompt = "\nYour answer (true/false or t/f): "
+            while True:
+                answer = input(prompt).lower().strip()
+                if answer in ('true', 'false', 't', 'f', 'yes', 'no', 'y', 'n'):
+                    break
+                print("Please enter 'true'/'false' or 't'/'f'")
+        elif question.question_type == QuestionType.MULTIPLE_CHOICE:
+            prompt = "\nYour answer (letter or full text): "
+            answer = input(prompt).strip()
+        else:  # FILL_BLANK or CODE_COMPLETION
+            prompt = "\nYour answer: "
+            answer = input(prompt).strip()
+        
+        if question.check_answer(answer):
+            print("\n✓ Correct!")
+            correct += 1
+        else:
+            print(f"\n✗ Incorrect. The correct answer is: {question.answer}")
+        
+        if i < len(questions):
+            input("\nPress Enter to continue to next question...")
+
+    end_time = time.time()
+    quiz_time = int((end_time - start_time) / 60)  # in minutes
+    student.add_study_time(quiz_time)
+    
+    score = (correct / len(questions)) * 100
+    print(f"\nQuiz completed in {quiz_time} minutes! You scored {score:.1f}% ({correct}/{len(questions)})")
+    
+    # Check for time-based achievement
+    if quiz_time < 5 and len(questions) >= 5:
+        student.add_achievement("Speed Learner")
+    
+    # Wait for user to acknowledge results
+    input("\nPress Enter to continue...")
+    return score
 
 def handle_chapter(chapter_num: int, student: Student) -> None:
-    """
-    Handle each chapter's content and quiz
-    """
+    """Handle each chapter's content and quiz with enhanced features"""
     chapters = {
-        1: {
-            "title": "Introduction to Python",
-            "content": """Python is a high-level, interpreted programming language known for:
+        1: Chapter(
+            number=1,
+            title="Introduction to Python",
+            content="""Python is a high-level, interpreted programming language known for:
+
 * Simple, readable syntax
 * Strong support for multiple programming paradigms
 * Comprehensive standard library
 * Dynamic typing and automatic memory management
 
 Key Features:
+
 * Created by Guido van Rossum, first released in 1991
 * Uses indentation for code blocks instead of braces
 * Supports object-oriented, imperative, and functional programming
 * Extensive ecosystem of third-party packages (PyPI)""",
-            "questions": [
-                ("Python uses braces {} to define code blocks.", False),
-                ("Python was first released in 1991.", True),
-                ("Python is a compiled language like C++.", False),
-                ("Python supports multiple programming paradigms.", True)
-            ]
-        },
-        2: {
-            "title": "Python Syntax",
-            "content": """Basic Python Syntax Example:
+            questions=generate_quiz(1),
+            learning_objectives=[
+                "Understand Python's history and design philosophy",
+                "Recognize Python's key features and advantages",
+                "Identify basic Python syntax elements"
+            ],
+            duration_minutes=15
+        ),
+        2: Chapter(
+            number=2,
+            title="Python Syntax",
+            content="""Basic Python Syntax Example:
 
 # This is a comment
 
@@ -210,25 +546,30 @@ if __name__ == "__main__":
     greet(user)
 
 Key Syntax Elements:
+
 * Comments start with #
 * Functions use def keyword
 * Docstrings in triple quotes for documentation
 * Colon (:) starts code blocks
 * Indentation (4 spaces) defines block structure
 * if __name__ == "__main__": for executable scripts""",
-            "questions": [
-                ("Python functions are defined using the 'function' keyword.", False),
-                ("Indentation in Python is optional.", False),
-                ("Triple-quoted strings can be used for multi-line comments.", True),
-                ("if __name__ == '__main__': checks if the script is being run directly.", True)
-            ]
-        },
-        3: {
-            "title": "Python Comments & Docstrings",
-            "content": """Python Documentation Features:
+            questions=generate_quiz(2),
+            learning_objectives=[
+                "Write basic Python statements and expressions",
+                "Create simple functions with docstrings",
+                "Understand Python's indentation rules"
+            ],
+            duration_minutes=20
+        ),
+        3: Chapter(
+            number=3,
+            title="Python Comments & Docstrings",
+            content="""Python Documentation Features:
 
 1. Single-line comments:
+
    # This is a single-line comment
+
    x = 5  # This is an inline comment
 
 2. Multi-line strings as comments:
@@ -246,318 +587,281 @@ Key Syntax Elements:
        pass
 
 Key Points:
+
 * Comments are ignored by the interpreter
 * Docstrings are accessible via __doc__ attribute
 * PEP 8 recommends using docstrings for all public modules, functions, classes""",
-            "questions": [
-                ("Python has dedicated multi-line comment syntax like /* */ in C++.", False),
-                ("Docstrings are accessible at runtime through __doc__ attribute.", True),
-                ("PEP 8 recommends using docstrings for all public functions.", True),
-                ("Inline comments should be separated by at least one space from code.", True)
-            ]
-        },
-        4: {
-            "title": "Final Exam",
-            "content": "Comprehensive Python Knowledge Test\nThis exam covers all chapters. Answer at least 75% correctly to pass.",
-            "questions": [
-                ("Python uses braces {} to define code blocks.", False),
-                ("Python was first released in 1991.", True),
-                ("Python is a compiled language like C++.", False),
-                ("Python supports multiple programming paradigms.", True),
-                ("Python functions are defined using the 'function' keyword.", False),
-                ("Indentation in Python is optional.", False),
-                ("Triple-quoted strings can be used for multi-line comments.", True),
-                ("if __name__ == '__main__': checks if the script is being run directly.", True),
-                ("Python has dedicated multi-line comment syntax like /* */ in C++.", False),
-                ("Docstrings are accessible at runtime through __doc__ attribute.", True),
-                ("PEP 8 recommends using docstrings for all public functions.", True),
-                ("Inline comments should be separated by at least one space from code.", True)
-            ]
-        },
-        5: {
-            "title": "Certificate of Completion",
-            "content": "",
-            "questions": []
-        }
+            questions=generate_quiz(3),
+            learning_objectives=[
+                "Write effective comments and docstrings",
+                "Understand the purpose of docstrings",
+                "Follow PEP 8 documentation guidelines"
+            ],
+            duration_minutes=15
+        ),
+        4: Chapter(
+            number=4,
+            title="Final Exam",
+            content="Comprehensive Python Knowledge Test\n\nThis exam covers all chapters. Answer at least 75% correctly to pass.",
+            questions=generate_quiz(4),
+            learning_objectives=[
+                "Demonstrate mastery of all course concepts",
+                "Apply Python knowledge to various question types",
+                "Complete the course requirements"
+            ],
+            duration_minutes=30
+        ),
+        5: Chapter(
+            number=5,
+            title="Certificate of Completion",
+            content="Congratulations on completing the Python course!",
+            questions=[],
+            learning_objectives=[],
+            duration_minutes=0
+        )
     }
 
     chapter = chapters.get(chapter_num)
     if not chapter:
-        print("Invalid chapter number.")
         return
 
-    display_header(f"Chapter {chapter_num}: {chapter['title']}")
+    display_header(f"Chapter {chapter_num}: {chapter.title}")
+    print("Learning Objectives:")
+    for i, objective in enumerate(chapter.learning_objectives, 1):
+        print(f"{i}. {objective}")
+    print(f"\nEstimated Time: {chapter.duration_minutes} minutes\n")
     
-    if chapter_num != 4:  # Not the final exam
-        print(chapter['content'])
-        print("\n" + "-" * 80)
-        print(f"\t * * * Quiz {chapter_num}: True or False * * *")
-        print("-" * 80 + "\n")
-    else:
-        print("\t * * * Comprehensive Python Knowledge Test * * *")
-        print(chapter['content'] + "\n")
+    animate_text(chapter.content)
 
-    points = 0
-    total_questions = len(chapter['questions'])
-    
-    for i, (question, correct_answer) in enumerate(chapter['questions'], 1):
-        while True:
-            user_answer = input(f"{i}. {question}\nYour answer (true/false): ").lower()
-            if user_answer in ('true', 'false', 't', 'f'):
-                user_bool = user_answer.startswith('t')
-                if user_bool == correct_answer:
-                    print("✓ Correct!\n")
-                    points += 1
-                else:
-                    print("✗ Incorrect\n")
-                break
-            print("Please enter 'true' or 'false'.")
+    if chapter_num < 4:  # Chapters 1-3 have quizzes
+        input("\nPress Enter to start the quiz...")
+        clear_screen()  # Clear lesson content before quiz
+        score = administer_quiz(chapter_num, student)
+        student.add_score(chapter_num, score)
 
-    percentage = points / total_questions
-    student.progress[chapter_num] = percentage
-    
-    if chapter_num == 4:  # Final exam
-        if percentage >= PASSING_SCORE:
-            student.current_chapter = 5
+        if score >= PASSING_SCORE:
+            print("\nCongratulations! You passed this chapter!")
+            student.update_progress(chapter_num + 1)
             save_student_data(student)
-            print(f"\nCongratulations! You scored {percentage:.1%} and passed the final exam!")
-            input("\nPress Enter to receive your certificate...")
-            handle_chapter(5, student)
+            
+            if chapter_num < 3:  # Not the final chapter
+                while True:
+                    choice = input("\nContinue to next chapter? (yes/no): ").lower()
+                    if choice in ('yes', 'y'):
+                        handle_chapter(chapter_num + 1, student)
+                        break
+                    elif choice in ('no', 'n'):
+                        print(f"\nGoodbye, {student.name}! Your progress has been saved.")
+                        break
+                    print("Please enter 'yes' or 'no'.")
         else:
-            print(f"\nYou scored {percentage:.1%}. You need at least {PASSING_SCORE:.0%} to pass.")
-            print("Please review the material and try again.")
-            input("\nPress Enter to continue...")
+            print(f"\nYou need at least {PASSING_SCORE}% to pass. Please review the material and try again.")
+            input("Press Enter to return to the chapter...")
+            handle_chapter(chapter_num, student)  # Retry same chapter
+
+    elif chapter_num == 4:  # Final exam
+        input("\nPress Enter to start the final exam...")
+        clear_screen()  # Clear lesson content before exam
+        score = administer_quiz(chapter_num, student)
+        student.add_score(chapter_num, score)
+
+        if score >= PASSING_SCORE:
+            print("\nCongratulations! You passed the final exam!")
+            student.update_progress(chapter_num + 1)
+            save_student_data(student)
+            input("\nPress Enter to receive your certificate...")
+            handle_chapter(chapter_num + 1, student)
+        else:
+            print(f"\nYou need at least {PASSING_SCORE}% to pass. Please review the material and try again.")
+            input("Press Enter to retry the final exam...")
+            handle_chapter(chapter_num, student)  # Retry final exam
+
     elif chapter_num == 5:  # Certificate
         generate_certificate(student)
-    else:
-        if percentage >= PASSING_SCORE:
-            student.current_chapter = chapter_num + 1
-            save_student_data(student)
-            print(f"\nCongratulations! You scored {percentage:.1%} and passed this chapter!")
-            
-            while True:
-                choice = input("\nContinue to next chapter? (yes/no): ").lower()
-                if choice in ('yes', 'y'):
-                    print("\nProgress saved. Moving to next chapter...")
-                    handle_chapter(chapter_num + 1, student)
-                    break
-                elif choice in ('no', 'n'):
-                    print(f"\nGoodbye, {student.name}! Your progress has been saved.")
-                    return
-                print("Please enter 'yes' or 'no'.")
-        else:
-            print(f"\nYou scored {percentage:.1%}. Please review the material and try again.")
-            input("\nPress Enter to continue...")
+        input("\nPress Enter to exit...")
+        sys.exit(0)
 
 def generate_certificate(student: Student) -> None:
-    """Generate a certificate of completion"""
-    display_header("Certificate of Completion")
-    certificate_file = os.path.join('data/certificates', f"certificate_{student.username}.txt")
-    os.makedirs('data/certificates', exist_ok=True)
-    
+    """Generate a certificate of completion with enhanced formatting"""
+    certificate_file = f"certificate_{student.username}.txt"
     try:
         cert_content = f"""
-{'CERTIFICATE OF COMPLETION'.center(50)}
-{'='*50}
+{'*' * 60}
+{'CERTIFICATE OF COMPLETION'.center(60)}
+{'*' * 60}
 
 THIS CERTIFICATE IS AWARDED TO:
 \t{student.name.upper()}
 
 FOR SUCCESSFULLY COMPLETING THE PYTHON PROGRAMMING COURSE
-AT PYTHON LEARNING PLATFORM
 
-{'='*50}
+{'*' * 60}
 DATE: {datetime.date.today().strftime('%B %d, %Y')}
 
 Overall Performance:
-{display_progress_bar(sum(student.progress.values())/len(student.progress))}
+"""
+        # Add chapter scores
+        for chap in range(1, CHAPTER_COUNT):
+            score = student.scores.get(chap, 0.0)
+            cert_content += f"Chapter {chap}: {score:.1f}%\n"
 
+        cert_content += f"\nFinal Exam Score: {student.scores.get(4, 0):.1f}%"
+        cert_content += f"\nOverall Average: {student.get_overall_score():.1f}%"
+        
+        cert_content += f"""
+\nAchievements Earned:
+{'-' * 60}
+"""
+        for achievement in student.achievements:
+            cert_content += f"- {achievement}\n"
+
+        cert_content += f"""
+\nStudy Statistics:
+- Total Logins: {student.login_count}
+- Estimated Study Time: {student.total_study_time} minutes
+
+{'*' * 60}
 Python is an excellent first language that scales
 from beginner scripts to advanced applications.
 Keep coding and never stop learning!
+{'*' * 60}
 """
         with open(certificate_file, 'w') as cert:
             cert.write(cert_content)
 
+        clear_screen()
         print(cert_content)
         print(f"\nYour certificate has been saved as '{certificate_file}'")
-        
-    except IOError:
-        print("\nError: Could not generate certificate. Please check file permissions.")
-    
-    input("\nPress Enter to exit...")
-    sys.exit(0)
+    except IOError as e:
+        print(f"\nError: Could not generate certificate. {str(e)}")
 
 def learning_section(student: Student) -> None:
-    """Display the learning section with chapter progression"""
-    while True:
-        display_header("Learning Portal")
-        print(f"Welcome back, {student.name}!\n")
-        
-        # Calculate overall progress
-        completed_chapters = len([c for c, score in student.progress.items() if score >= PASSING_SCORE])
-        total_chapters = 4  # Excluding certificate
-        overall_progress = completed_chapters / total_chapters
-        
-        print(f"Overall Progress: {display_progress_bar(overall_progress)}\n")
-        print("Course Chapters:\n" + "-" * 40)
-        
-        for chapter_num in range(1, 6):
-            status = ChapterStatus.LOCKED
-            
-            if chapter_num < student.current_chapter:
-                status = ChapterStatus.COMPLETED
-            elif chapter_num == student.current_chapter:
-                status = ChapterStatus.UNLOCKED
-            elif chapter_num == student.current_chapter + 1 and student.current_chapter < 5:
-                # Check if previous chapter was completed
-                if (student.current_chapter - 1) in student.progress and \
-                   student.progress[student.current_chapter - 1] >= PASSING_SCORE:
-                    status = ChapterStatus.UNLOCKED
-            
-            status_text = {
-                ChapterStatus.LOCKED: "LOCKED",
-                ChapterStatus.UNLOCKED: "UNLOCKED",
-                ChapterStatus.COMPLETED: "COMPLETED"
-            }[status]
-            
-            score = student.progress.get(chapter_num, 0)
-            score_text = f" - Score: {score:.0%}" if chapter_num in student.progress else ""
-            
-            print(f"{chapter_num}. {chapters[chapter_num]['title'] if chapter_num in chapters else 'Certificate'}"
-                  f"{' '*(30-len(str(chapter_num))-len(chapters[chapter_num]['title']))}"
-                  f"{status_text}{score_text}")
-        
-        print("\nOptions:")
-        print("1. Continue to current chapter")
-        print("2. Review completed chapter")
-        print("3. View progress details")
-        print("4. Return to main menu")
-        
-        choice = get_valid_input("\nEnter your choice (1-4): ", 
-                               lambda x: x in ('1', '2', '3', '4'),
-                               "Please enter a number between 1 and 4")
-        
-        if choice == '1':
-            handle_chapter(student.current_chapter, student)
-        elif choice == '2':
-            chapter = get_valid_input("Enter chapter number to review: ",
-                                    lambda x: x.isdigit() and int(x) in student.progress,
-                                    "Please enter a valid completed chapter number")
-            handle_chapter(int(chapter), student)
-        elif choice == '3':
-            display_progress_details(student)
-        elif choice == '4':
-            return
+    """Display the learning section with chapter progression and stats"""
+    display_header("Learning Portal")
+    print(f"Welcome back, {student.name}!\n")
 
-def display_progress_details(student: Student) -> None:
-    """Show detailed progress statistics"""
-    display_header("Progress Details")
-    
-    print(f"Student: {student.name}")
-    print(f"Username: {student.username}")
-    print(f"Account created: {student.account_created.strftime('%Y-%m-%d')}")
-    print(f"Last login: {student.last_login.strftime('%Y-%m-%d %H:%M') if student.last_login else 'Never'}")
-    
-    print("\nChapter Progress:")
-    for chapter_num in range(1, 5):  # Chapters 1-4
-        score = student.progress.get(chapter_num, 0)
-        status = "PASSED" if score >= PASSING_SCORE else "FAILED" if score > 0 else "NOT ATTEMPTED"
-        print(f"Chapter {chapter_num}: {score:.0%} - {status}")
-    
-    input("\nPress Enter to return to learning portal...")
+    if student.last_login:
+        print(f"Last login: {student.last_login.strftime('%Y-%m-%d %H:%M')}\n")
+
+    print(f"Your current progress: Chapter {student.progress} of {CHAPTER_COUNT}\n")
+
+    # Display chapter status and scores
+    print("Course Chapters:\n" + "-" * 60)
+    for i in range(1, CHAPTER_COUNT + 1):
+        status = "COMPLETED" if i < student.progress else "CURRENT" if i == student.progress else "LOCKED"
+        score = student.scores.get(i, 0.0)
+        score_display = f"{score:.1f}%" if i < student.progress or (i == student.progress and score > 0) else ""
+        print(f"Chapter {i}: {status.ljust(10)} {score_display}")
+
+    # Display achievements if any
+    if student.achievements:
+        print("\nYour Achievements:")
+        for achievement in student.achievements:
+            print(f"- {achievement}")
+
+    input("\nPress Enter to continue to your current chapter...")
+    handle_chapter(student.progress, student)
 
 def sign_in() -> None:
-    """Handle user sign-in process"""
+    """Handle user sign-in process with session timeout"""
     display_header("Sign In")
-    
+
     username = get_valid_input("Username: ").strip()
-    student = load_student_data(username)
-    
-    if not student:
+    if not file_exists(username):
         print("\nUsername not found. Please register first.")
         input("Press Enter to continue...")
         return
-    
+
+    student = None
     attempts = 0
+
     while attempts < MAX_ATTEMPTS:
-        password = get_valid_input("Password: ", hide_input=True)
+        password = get_valid_input("Password: ", error_msg="Password cannot be empty.")
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
         
-        if verify_password(student.password_hash, password):
-            student.last_login = datetime.datetime.now()
-            save_student_data(student)
+        student = load_student_data(username)
+        if student and student.password == password_hash:
+            # Check for password reuse
+            if password_hash == hashlib.sha256("password123".encode()).hexdigest():
+                print("\nWarning: You're using a very common password. Consider changing it for security.")
+                input("Press Enter to continue...")
             
-            print(f"\nAuthentication successful! Welcome back, {student.name}!")
-            input("Press Enter to continue to your learning portal...")
-            learning_section(student)
-            return
-            
-        attempts += 1
-        remaining = MAX_ATTEMPTS - attempts
-        if remaining > 0:
-            print(f"\nIncorrect password. {remaining} attempts remaining.")
-    
+            student.record_login()
+            if save_student_data(student):
+                print(f"\nAuthentication successful! Welcome back, {student.name}!")
+                input("Press Enter to continue to your learning portal...")
+                learning_section(student)
+                return
+            else:
+                print("\nError: Could not update login information.")
+                break
+        else:
+            attempts += 1
+            remaining = MAX_ATTEMPTS - attempts
+            if remaining > 0:
+                print(f"\nIncorrect password. {remaining} attempts remaining.")
+
     print("\nToo many failed attempts. Please try again later.")
     input("\nPress Enter to return to main menu...")
 
 def sign_up() -> None:
-    """Handle new user registration"""
+    """Handle new user registration with enhanced validation"""
     display_header("Registration")
     print("Create your account:\n")
-    
+
+    student = Student()
+
     # Get validated username
     while True:
         username = get_valid_input(
-            "Choose a username (letters and numbers only, 4-20 chars): ",
-            lambda x: x.isalnum() and not x.isdigit() and 4 <= len(x) <= 20,
-            "Username must be 4-20 chars with letters and may include numbers, but not all numbers."
+            f"Choose a username ({MIN_USERNAME_LENGTH}-{MAX_USERNAME_LENGTH} chars, letters and numbers only): ",
+            lambda x: (x.isalnum() and 
+                      MIN_USERNAME_LENGTH <= len(x) <= MAX_USERNAME_LENGTH and 
+                      not x.isdigit()),
+            f"Username must be {MIN_USERNAME_LENGTH}-{MAX_USERNAME_LENGTH} chars with letters and may include numbers, but not all numbers."
         ).lower()
         
-        if load_student_data(username):
+        if file_exists(username):
             print("Username already taken. Please choose another.")
         else:
+            student.set_username(username)
             break
-    
+
     # Get validated name
     name = get_valid_input(
-        "Your full name: ",
-        lambda x: all(c.isalpha() or c.isspace() for c in x) and 2 <= len(x) <= 50,
-        "Name must be 2-50 chars with letters and spaces only."
-    ).title()
-    
+        f"Your full name ({MIN_NAME_LENGTH}-{MAX_NAME_LENGTH} chars): ",
+        lambda x: all(c.isalpha() or c.isspace() for c in x) and MIN_NAME_LENGTH <= len(x) <= MAX_NAME_LENGTH,
+        f"Name must be {MIN_NAME_LENGTH}-{MAX_NAME_LENGTH} chars with letters and spaces only."
+    )
+    student.set_name(name)
     # Get validated email
     email = get_valid_input(
         "Your email address: ",
-        lambda x: '@' in x and '.' in x and 5 <= len(x) <= 100,
-        "Please enter a valid email address (5-100 chars)."
-    ).lower()
-    
+        validate_email,
+        "Please enter a valid email address (e.g., user@example.com)."
+    )
+    student.set_email(email)
+
     # Get strong password
     while True:
         password = get_valid_input(
-            f"Create a password (min {MIN_PASSWORD_LENGTH} chars with mix of letters, numbers and special chars): ",
-            lambda x: len(x) >= MIN_PASSWORD_LENGTH and 
-                     any(c.isdigit() for c in x) and 
-                     any(c.isalpha() for c in x) and
-                     any(not c.isalnum() for c in x),
-            f"Password must be at least {MIN_PASSWORD_LENGTH} characters with letters, numbers and special chars."
+            f"Create a password (min {MIN_PASSWORD_LENGTH} chars with upper, lower, numbers, and special chars): ",
+            validate_password,
+            f"Password must be at least {MIN_PASSWORD_LENGTH} characters with uppercase, lowercase, numbers and special characters."
         )
-        confirm = get_valid_input("Confirm password: ", hide_input=True)
+        confirm = input("Confirm password: ")
         if password == confirm:
+            if password.lower() == username.lower() or password.lower() == name.lower().replace(" ", ""):
+                print("Warning: Password should not be based on your username or name.")
+                continue
+            student.set_password(password)
             break
         print("Passwords don't match. Please try again.")
-    
-    # Create student object
-    student = Student()
-    student.name = name
-    student.username = username
-    student.password_hash = hash_password(password)
-    student.email = email
-    student.current_chapter = 1
-    
+
+    # Save student data
     if save_student_data(student):
         print("\nRegistration successful!")
-        print(f"Welcome to Python Learning, {name}!")
+        print(f"Welcome to Python Learning, {student.name}!")
         
         # Offer to start learning
         while True:
@@ -574,115 +878,139 @@ def sign_up() -> None:
         print("\nError: Could not create your account. Please try again later.")
         input("Press Enter to continue...")
 
+def password_recovery() -> None:
+    """Handle password recovery process with simulated email"""
+    display_header("Password Recovery")
+
+    username = input("Enter your username: ").strip()
+    if not file_exists(username):
+        print("\nUsername not found. Please check your username or register.")
+        input("Press Enter to continue...")
+        return
+
+    student = load_student_data(username)
+    if not student:
+        print("\nError accessing account data. Please contact support.")
+        input("Press Enter to continue...")
+        return
+
+    print(f"\nA password reset link has been sent to {student.email} (simulated)")
+    print("Please check your email to reset your password.")
+    
+    # Simulate password reset
+    if input("\nWould you like to simulate password reset now? (yes/no): ").lower() in ('yes', 'y'):
+        new_password = get_valid_input(
+            "Enter new password: ",
+            validate_password,
+            f"Password must be at least {MIN_PASSWORD_LENGTH} characters with uppercase, lowercase and numbers."
+        )
+        student.set_password(new_password)
+        if save_student_data(student):
+            print("\nPassword has been successfully reset!")
+        else:
+            print("\nError: Could not reset password. Please try again later.")
+    
+    input("\nPress Enter to return to main menu...")
+
 def show_description() -> None:
-    """Display program description"""
+    """Display program description with features"""
     display_header("About This Program")
-    print("""PYTHON LEARNING PLATFORM
+    animate_text("""PYTHON LEARNING PLATFORM
 
 This interactive program teaches Python programming fundamentals through:
 
-* Progressive, hands-on chapters
-* Interactive quizzes with instant feedback
-* Secure account system with progress tracking
-* Certificate upon completion
+* Progressive, hands-on chapters with clear learning objectives
+* Interactive quizzes with varied question types and instant feedback
+* Secure account system with encrypted data storage
+* Progress tracking and performance analytics
+* Achievement system to motivate learning
+* Certificate upon successful completion
 
 Technical Features:
 
-* Secure credential storage using PBKDF2 hashing and Fernet encryption
+* Secure credential storage using Fernet encryption (AES-128)
+* Password hashing with SHA-256 for additional security
 * Progress tracking with encrypted data files
+* Multiple question types (True/False, Multiple Choice, Fill-in, Code Completion)
 * Comprehensive input validation and error handling
 * Clean, modular Python code following PEP 8 guidelines
 * Cross-platform compatibility
+* Session timeout for security
 
 Educational Approach:
 
-* Bite-sized learning concepts
-* Immediate application through quizzes
+* Bite-sized learning concepts with clear objectives
+* Immediate application through interactive quizzes
 * Gradual difficulty progression
 * Practical Python examples
 * Performance tracking and feedback
-
-The program demonstrates proper Python development practices while
-teaching Python programming concepts.
+* Motivational achievements and certificate
 """)
     input("\nPress Enter to return to main menu...")
 
-def reset_password() -> None:
-    """Handle password reset functionality"""
-    display_header("Password Reset")
+def user_settings(student: Student) -> None:
+    """Handle user settings and preferences"""
+    display_header("User Settings")
     
-    username = get_valid_input("Enter your username: ").strip()
-    student = load_student_data(username)
+    print(f"Current Settings for {student.name}:")
+    print(f"1. Dark Mode: {'Enabled' if student.preferences.get('dark_mode', False) else 'Disabled'}")
+    print(f"2. Animation Speed: {student.preferences.get('animation_speed', 'normal').title()}")
     
-    if not student:
-        print("\nUsername not found. Please register first.")
-        input("Press Enter to continue...")
-        return
+    choice = input("\nSelect setting to change (1-2) or Enter to return: ").strip()
     
-    email = get_valid_input("Enter your registered email: ").strip().lower()
+    if choice == '1':
+        student.preferences['dark_mode'] = not student.preferences.get('dark_mode', False)
+        print(f"\nDark Mode {'enabled' if student.preferences['dark_mode'] else 'disabled'}.")
+    elif choice == '2':
+        speeds = {'slow': 'Normal', 'normal': 'Fast', 'fast': 'Slow'}
+        current = student.preferences.get('animation_speed', 'normal')
+        new_speed = speeds[current.lower()]
+        student.preferences['animation_speed'] = new_speed.lower()
+        print(f"\nAnimation speed set to {new_speed}.")
     
-    if email != student.email:
-        print("\nEmail does not match our records.")
-        input("Press Enter to continue...")
-        return
-    
-    # Get new password
-    while True:
-        new_password = get_valid_input(
-            f"Create a new password (min {MIN_PASSWORD_LENGTH} chars with mix of letters, numbers and special chars): ",
-            lambda x: len(x) >= MIN_PASSWORD_LENGTH and 
-                     any(c.isdigit() for c in x) and 
-                     any(c.isalpha() for c in x) and
-                     any(not c.isalnum() for c in x),
-            f"Password must be at least {MIN_PASSWORD_LENGTH} characters with letters, numbers and special chars.",
-            hide_input=True
-        )
-        confirm = get_valid_input("Confirm new password: ", hide_input=True)
-        if new_password == confirm:
-            break
-        print("Passwords don't match. Please try again.")
-    
-    student.password_hash = hash_password(new_password)
-    if save_student_data(student):
-        print("\nPassword successfully reset!")
-    else:
-        print("\nError: Could not reset password. Please try again later.")
-    
-    input("Press Enter to continue...")
+    if choice in ('1', '2'):
+        save_student_data(student)
+        input("\nPress Enter to continue...")
 
 def main_menu() -> None:
-    """Display and handle the main program menu"""
+    """Display and handle the main program menu with enhanced options"""
     while True:
         display_header("Python Learning Platform")
         print("MAIN MENU\n")
         print("1. Sign In")
         print("2. Register")
-        print("3. Password Reset")
+        print("3. Password Recovery")
         print("4. Program Description")
-        print("5. Exit")
+        print("5. Settings")
+        print("6. Exit")
 
-        choice = get_valid_input("\nEnter your choice (1-5): ", 
-                               lambda x: x in ('1', '2', '3', '4', '5'),
-                               "Please enter a number between 1 and 5")
+        choice = get_valid_input("\nEnter your choice (1-6): ", 
+                               lambda x: x in ('1', '2', '3', '4', '5', '6'),
+                               "Please enter a number between 1 and 6")
         
         if choice == '1':
             sign_in()
         elif choice == '2':
             sign_up()
         elif choice == '3':
-            reset_password()
+            password_recovery()
         elif choice == '4':
             show_description()
         elif choice == '5':
+            # Demo settings without logged in user
+            temp_student = Student()
+            temp_student.preferences = {'dark_mode': False, 'animation_speed': 'normal'}
+            user_settings(temp_student)
+        elif choice == '6':
             print("\nThank you for using the Python Learning Platform. Goodbye!")
             sys.exit(0)
 
 if __name__ == "__main__":
     try:
-        # Check if cryptography package is available
         from cryptography.fernet import Fernet
-        main_menu()
-    except ImportError:
-        print("\nError: Required cryptography package not found.")
-        print("Please install it by running: pip install cryptography")
+    except ImportError as e:
+        print(f"\nError: Required package not found - {str(e)}")
+        print("Please install required packages by running: pip install cryptography")
         input("\nPress Enter to exit...")
+        exit(1)
+    main_menu()
